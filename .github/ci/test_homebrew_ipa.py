@@ -48,6 +48,20 @@ class OriginalPayload(unittest.TestCase):
                          [('svc', '#0x27'), ('svc', '#0xb')])
         self.assertIn('0x4400', instructions[0].op_str)
 
+    def test_generated_profile_leaves_room_after_native_memory_partitions(self):
+        # hle_svc.c reserves the first 256 MiB before alias, stack and heap.
+        # The first SVC aborts on device if any region exceeds the reservation.
+        with tempfile.TemporaryDirectory() as temp:
+            root = homebrew.generate(Path(temp) / 'fixture')
+            rows = dict(line.split('\t', 1) for line in
+                        (root / 'profiles' / homebrew.TITLE / 'game.tsv').read_text().splitlines())
+            reserve, alias, stack, pool = (int(rows[k], 0) for k in
+                                           ('mem_reserve', 'mem_alias', 'mem_stack', 'app_pool'))
+            for value in (reserve, alias, stack):
+                self.assertEqual(value % 0x4000, 0)
+            self.assertGreaterEqual(reserve - 0x10000000 - alias - stack, pool,
+                                    'Native address space must fit prefix, alias, stack and application heap')
+
     def test_bundled_romfs_matches_sources_and_rejects_missing_or_changed_data(self):
         import sys
         sys.path.insert(0, str(homebrew.REPO / 'engine/dm/tools'))

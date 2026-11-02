@@ -86,7 +86,7 @@ def generate(root):
     values = {'title_id': TITLE, 'program_id': TITLE, 'name': 'NX2Apple Homebrew Test',
               'ipa': 'NX2Apple-Homebrew.ipa', 'app_category': 'public.app-category.developer-tools',
               'package': 'v0', 'shader_versions': 'v0', 'modules': 'main', 'romfs_marker': 'homebrew.txt',
-              'zip_store': '.metallib', 'mem_reserve': '0x10000000', 'mem_alias': '0x4000000',
+              'zip_store': '.metallib', 'mem_reserve': '0x20000000', 'mem_alias': '0x4000000',
               'mem_stack': '0x400000', 'app_pool': '0x8000000', 'mem_used': '0x100000', 'sys_resource': '0'}
     (profile / 'game.tsv').write_text(''.join(f'{k}\t{v}\n' for k, v in values.items()) + f'build\tv0\t1.0\tmain={build_id}\n')
     for name in ('shader_map.tsv', 'pso_manifest.tsv'):
