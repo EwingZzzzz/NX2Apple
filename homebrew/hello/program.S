@@ -13,3 +13,5 @@ nnMain:
     b nnMain
 message:
     .ascii "NX2Apple original homebrew: rewritten guest code is running"
+message_end:
+.equ message_length, message_end - message
