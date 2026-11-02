@@ -2,6 +2,52 @@
 
 ## Build checks from Windows with GitHub Actions
 
+### Download an original homebrew IPA
+
+**Actions → Build redistributable homebrew IPA → Run workflow** builds the fixed,
+committed [original homebrew program](homebrew/hello/README.md). It accepts no game
+files, keys, download URLs or signing credentials. A PR changing this workflow or
+its source runs the same build before merge. After merge it can be triggered from
+a browser on `main` without a local Mac.
+
+Download the `NX2Apple-Homebrew-IPA-<run ID>` artifact from a successful run, extract
+the outer ZIP, and use `NX2Apple-Homebrew.ipa`. The artifact includes SHA-256 sums,
+an archive file list and a JSON build report. A separate artifact contains only
+homebrew build diagnostics. IPA artifacts expire after 14 days, logs after seven.
+The report explicitly distinguishes building from signing, installing and running.
+
+This is the complete unencrypted dump-folder build path through the real NSP build
+script, not the upstream compile-only smoke fixture. It exercises RomFS packing,
+NSO rewriting, GLSL/SPIR-V/MSL translation, iOS compilation and IPA packing. It does
+not exercise encrypted NSP extraction, retail profiles, NVN translation or a game
+running on a GPU. No proprietary SDK is used. The complete small homebrew RomFS is
+inside the IPA. System fonts are replaced with redistributable OFL fonts before
+upload, with font and third-party license notices included.
+
+For a Windows installation test, [Sideloadly](https://sideloadly.io/index.html)
+supports loading an IPA and signing it locally for a connected iPad using a free
+or paid Apple account. Keep Apple credentials and any two-factor code in the local signing
+tool, never in this chat, Git or Actions. Follow the tool's current Apple driver
+requirements. Connect and unlock the iPad, accept its Trust prompt, and select it
+in the signer. Choose the extracted IPA and complete account authentication locally.
+The alternative [AltStore Classic Windows route](https://faq.altstore.io/altstore-classic/how-to-install-altstore-windows)
+also requires local Apple-account authentication and device pairing.
+
+The host currently targets iPadOS 26 or newer. Enable Developer Mode and trust the
+developer profile on the iPad when requested. After installation, open **NX2Apple
+Homebrew Test**. It is CPU-only and does not draw the sample shaders. Inspect its
+Files app Documents folder for `log.txt`: repeated
+`NX2Apple original homebrew: rewritten guest code is running` messages are the
+runtime success criterion. A successful cloud build or a blank game view alone
+does not prove that the rewritten code ran. Free-account signatures normally need
+renewal after seven days. This tiny test does not request Increased Memory Limit,
+but retail games can need it and must be checked separately.
+
+Physical pairing, Trust/Developer Mode actions, Apple login/2FA and confirming the
+on-device log require the device owner. A GitHub-hosted Mac cannot reach a USB iPad
+attached to a Windows PC. Until the device log is inspected, installation and guest
+execution remain untested even when the downloaded IPA is structurally valid.
+
 The [Apple dependency preflight and private IPA workflow](.github/workflows/apple-preflight.yml)
 uses GitHub's Apple Silicon `xcode-27` hosted image. It is manually triggerable with
 **Actions → Apple dependency preflight and private IPA → Run workflow**. Leave
