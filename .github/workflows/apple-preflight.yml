@@ -1,0 +1,171 @@
+name: Apple dependency preflight and private IPA
+
+on:
+  pull_request:
+    paths: ['.github/ci/**', '.github/workflows/apple-preflight.yml']
+  workflow_dispatch:
+    inputs:
+      build_ipa:
+        description: 'Build my legally owned dump (private repository and default branch only)'
+        type: boolean
+        default: false
+      required_free_gib:
+        description: 'Private build minimum free GiB, including download, extraction and output'
+        type: string
+        default: '80'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apple-preflight-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate-and-build:
+    runs-on: xcode-27
+    timeout-minutes: 180
+    environment: ${{ inputs.build_ipa && 'private-ipa' || 'preflight' }}
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate request and initial capacity (no secrets)
+        env:
+          BUILD_IPA: ${{ inputs.build_ipa }}
+          REPO_PRIVATE: ${{ github.event.repository.private }}
+          DEFAULT_REF: refs/heads/${{ github.event.repository.default_branch }}
+          REQUIRED_FREE_GIB: ${{ inputs.required_free_gib }}
+        run: |
+          set -euo pipefail
+          export SAFE_LOGS="$RUNNER_TEMP/nx2apple-preflight"
+          echo "SAFE_LOGS=$SAFE_LOGS" >> "$GITHUB_ENV"
+          echo "PRIVATE_ROOT=$RUNNER_TEMP/nx2apple-private" >> "$GITHUB_ENV"
+          mkdir -p "$SAFE_LOGS"
+          if [[ "$BUILD_IPA" == true ]]; then
+            [[ "$REPO_PRIVATE" == true && "$GITHUB_REF" == "$DEFAULT_REF" ]] || {
+              echo '::error::IPA builds require a private repository and its reviewed default branch.'
+              exit 1
+            }
+          fi
+          python3 .github/ci/apple_ci.py disk 8 "$RUNNER_TEMP" | tee "$SAFE_LOGS/disk.log"
+
+      - name: Find and explicitly select installed Xcode 27.2
+        run: |
+          set -euo pipefail
+          [[ "$(uname -m)" == arm64 ]] || { echo '::error::An Apple Silicon arm64 runner is required.'; exit 1; }
+          selected=''
+          for app in /Applications/Xcode*.app; do
+            dev="$app/Contents/Developer"
+            version=$(DEVELOPER_DIR="$dev" xcodebuild -version 2>/dev/null || true)
+            if [[ "$(printf '%s\n' "$version" | head -n 1)" == 'Xcode 27.2' ]]; then
+              selected="$dev"
+              break
+            fi
+          done
+          [[ -n "$selected" ]] || {
+            echo '::error::Xcode 27.2 is not installed on this runner. No fallback or compiler override is used.'
+            ls -d /Applications/Xcode*.app || true
+            exit 1
+          }
+          sudo xcode-select --switch "$selected"
+          export DEVELOPER_DIR="$selected"
+          echo "DEVELOPER_DIR=$selected" >> "$GITHUB_ENV"
+          {
+            sw_vers
+            uname -m
+            echo "Selected: $selected"
+            xcodebuild -version
+            xcodebuild -showsdks
+            xcrun --sdk iphoneos --show-sdk-version
+            xcrun --sdk iphoneos --show-sdk-build-version
+            xcrun --sdk iphoneos --show-sdk-path
+          } | tee "$SAFE_LOGS/versions.log"
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'
+          architecture: arm64
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Install documented dependencies and selected Xcode Metal tools
+        run: |
+          set -euo pipefail
+          {
+            # Brewfile's formulas, with setup-dotnet pinning its rolling SDK cask to 10.
+            brew install xcodegen zstd spirv-cross glslang
+            python -m venv .venv
+            .venv/bin/python -m pip install lz4 'capstone>=5,<6' fonttools zbic nsz "backports.zstd; python_version < '3.14'"
+            echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+            xcodebuild -downloadComponent MetalToolchain
+            dotnet --info
+            dotnet --list-sdks
+            dotnet --list-runtimes
+          } 2>&1 | tee "$SAFE_LOGS/dependencies.log"
+
+      - name: Sync pinned nxnative engine and validate patch queue
+        run: |
+          set -euo pipefail
+          {
+            git config core.hooksPath .githooks
+            python tools/engine.py sync
+            python tools/engine.py stale
+            python tools/engine.py check
+            echo "NX2Apple: $(git rev-parse HEAD)"
+            echo "Upstream pin: $(cat .upstream-ref)"
+            echo "Patched engine: $(git -C engine rev-parse HEAD)"
+          } 2>&1 | tee "$SAFE_LOGS/engine.log"
+
+      - name: Dependency smoke checks and synthetic iOS Metal build (no games or keys)
+        run: |
+          set -euo pipefail
+          {
+            python -m unittest discover -s .github/ci -p 'test_*.py' -v
+            python .github/ci/apple_ci.py preflight
+            dotnet build engine/dm/tools/nx_extract/nx_extract.csproj -c Release -o "$RUNNER_TEMP/nx2apple-extractor"
+            python .github/ci/apple_ci.py disk 4 "$RUNNER_TEMP"
+          } 2>&1 | tee "$SAFE_LOGS/checks.log"
+
+      # This upload happens BEFORE any private input or secret is made available.
+      - name: Upload only public preflight logs and synthetic output
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: apple-preflight-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/nx2apple-preflight/disk.log
+            ${{ runner.temp }}/nx2apple-preflight/versions.log
+            ${{ runner.temp }}/nx2apple-preflight/dependencies.log
+            ${{ runner.temp }}/nx2apple-preflight/engine.log
+            ${{ runner.temp }}/nx2apple-preflight/checks.log
+            ${{ runner.temp }}/nx2apple-preflight/probe.metal
+            ${{ runner.temp }}/nx2apple-preflight/probe.air
+            ${{ runner.temp }}/nx2apple-preflight/probe.metallib
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Optional private dump to IPA (no public build log or artifact)
+        if: ${{ success() && inputs.build_ipa }}
+        env:
+          REQUIRED_FREE_GIB: ${{ inputs.required_free_gib }}
+          INPUT_URL: ${{ secrets.NX2APPLE_INPUT_URL }}
+          INPUT_SHA256: ${{ secrets.NX2APPLE_INPUT_SHA256 }}
+          PROD_KEYS: ${{ secrets.NX2APPLE_PROD_KEYS }}
+          OUTPUT_URL: ${{ secrets.NX2APPLE_OUTPUT_URL }}
+        run: python .github/ci/apple_ci.py private-build
+
+      - name: Remove private workspace, raw logs and generated engine data
+        if: ${{ always() && inputs.build_ipa }}
+        run: python .github/ci/apple_ci.py cleanup
