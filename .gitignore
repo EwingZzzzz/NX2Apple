@@ -46,3 +46,22 @@ frontend/NX2Apple.app/
 /scripts/
 /docs/
 /ref/
+
+# Private user inputs and game-derived/signing outputs never belong in Git.
+*.nsp
+*.xci
+*.nsz
+*.xcz
+*.nca
+*.nso
+*.ipa
+*.p12
+*.pfx
+*.mobileprovision
+*.keys
+*.cer
+*.certSigningRequest
+*.p8
+*.pem
+*.key
+[Rr]om[Ff][Ss].img
