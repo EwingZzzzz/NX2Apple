@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path
 import plistlib
-import shutil
 import struct
 import subprocess
 import sys
@@ -115,6 +114,31 @@ def select_xcode():
     raise RuntimeError('Xcode 27.2 is not installed. No fallback compiler is used.')
 
 
+def validate_romfs(image, original):
+    """Verify the packaged image contains exactly our three original source files."""
+    if len(image) < 32:
+        raise RuntimeError('Homebrew RomFS image is missing or truncated')
+    magic, offset, size, count = struct.unpack_from('<8sQQQ', image)
+    if magic != b'DMROMFS1' or offset < 32 or offset + size != len(image) or count != 4 or size < count * 24:
+        raise RuntimeError('Invalid homebrew RomFS image')
+    names, files = offset + count * 24, {}
+    for i in range(count):
+        start, length, name_offset, name_length, kind, flags = struct.unpack_from('<QQIHBB', image, offset + i * 24)
+        if flags or names + name_offset + name_length > len(image):
+            raise RuntimeError('Invalid homebrew RomFS index')
+        name = image[names + name_offset:names + name_offset + name_length].decode()
+        if i == 0:
+            if name or kind != 0 or start != 1 or length != 3:
+                raise RuntimeError('Invalid homebrew RomFS root')
+        else:
+            if kind != 1 or name in files or start < 32 or start + length > offset:
+                raise RuntimeError('Invalid homebrew RomFS file')
+            files[name] = image[start:start + length]
+    expected = {p.name: p.read_bytes() for p in original.iterdir() if p.is_file()}
+    if set(files) != {'homebrew.txt', 'triangle.vert.spv', 'triangle.frag.spv'} or files != expected:
+        raise RuntimeError('Packaged RomFS differs from the original homebrew')
+
+
 def finish_ipa(raw, final, root):
     """Remove system fonts, add redistributable fonts/notices, then validate the archive."""
     font = REPO / 'frontend/fonts/Manrope.ttf'
@@ -124,12 +148,13 @@ def finish_ipa(raw, final, root):
     # Production's archive has no bundle resource signature. The sideloader signs the final bundle.
     with zipfile.ZipFile(raw) as source, zipfile.ZipFile(final, 'w', compression=zipfile.ZIP_DEFLATED) as output:
         for item in source.infolist():
-            if item.filename.endswith(('dm/font/standard.ttf', 'dm/font/nintendo_ext.ttf')):
+            if item.filename.endswith(('dm/font/standard.ttf', 'dm/font/standard_small.ttf', 'dm/font/nintendo_ext.ttf')):
                 continue
             if item.filename.endswith('embedded.mobileprovision') or '/_CodeSignature/' in item.filename:
                 raise RuntimeError('Unexpected signing credential/resource signature in source IPA')
             output.writestr(item, source.read(item))
         output.write(font, prefix + 'dm/font/standard.ttf')
+        output.write(font, prefix + 'dm/font/standard_small.ttf')
         output.write(ext, prefix + 'dm/font/nintendo_ext.ttf')
         output.write(REPO / 'frontend/fonts/Manrope-OFL.txt', prefix + 'dm/font/OFL.txt')
         output.write(REPO / 'LICENSE', prefix + 'LICENSES/NX2Apple-MIT.txt')
@@ -148,8 +173,15 @@ def finish_ipa(raw, final, root):
         executable = z.read(prefix + info['CFBundleExecutable'])
         if executable[:4] != bytes.fromhex('cffaedfe') or struct.unpack_from('<I', executable, 4)[0] != 0x0100000c:
             raise RuntimeError('Expected an arm64 Mach-O executable')
-        if z.read(prefix + 'dm/font/standard.ttf') != font.read_bytes():
-            raise RuntimeError('IPA standard font is not OFL Manrope')
+        for name in ('standard.ttf', 'standard_small.ttf'):
+            if z.read(prefix + 'dm/font/' + name) != font.read_bytes():
+                raise RuntimeError('IPA standard font is not OFL Manrope')
+        if {n for n in z.namelist() if n.lower().endswith(('.ttf', '.otf'))} != {
+                prefix + 'dm/font/' + n for n in ('standard.ttf', 'standard_small.ttf', 'nintendo_ext.ttf')}:
+            raise RuntimeError('Unexpected font in public IPA')
+        if prefix + 'romfs.id' in z.namelist() or prefix + 'romfs.img' not in z.namelist():
+            raise RuntimeError('Slim IPA rejected: the original homebrew RomFS must be bundled')
+        validate_romfs(z.read(prefix + 'romfs.img'), root / 'dump/base/romfs')
         forbidden = ('.nsp', '.xci', '.nsz', '.xcz', '.nca', '.keys', '.p12', '.pfx', '.mobileprovision', '.p8', '.pem')
         if any(n.lower().endswith(forbidden) for n in z.namelist()):
             raise RuntimeError('Forbidden input or credential found in IPA')
@@ -158,7 +190,8 @@ def finish_ipa(raw, final, root):
               'bytes': final.stat().st_size, 'bundle_id': BUNDLE, 'title_id': TITLE,
               'nx2apple_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
               'engine_pin': (REPO / '.upstream-ref').read_text().strip(),
-              'built': True, 'signed_for_device': False, 'installed_on_ipad': False, 'guest_executed': False,
+              'built': True, 'original_romfs_bundled': True,
+              'signed_for_device': False, 'installed_on_ipad': False, 'guest_executed': False,
               'input': 'original unencrypted homebrew generated from committed source, no keys',
               'limits': 'Vulkan shader preparation tested, no runtime graphics or retail NVN validation'}
     (final.parent / 'build-report.json').write_text(json.dumps(report, indent=2) + '\n')
@@ -173,7 +206,8 @@ def build(root, output):
     for stage in ('vert', 'frag'):
         run('glslangValidator', '-V', REPO / f'homebrew/hello/triangle.{stage}', '-o', romfs / f'triangle.{stage}.spv')
     env = dict(os.environ, DM_GAMES_DIR=str(root / 'profiles'), DM_GAMES_FIRST='1', J='3', DM_REWRITE_J='1',
-               STD_FONT=str(REPO / 'frontend/fonts/Manrope.ttf'), DM_ENTITLEMENTS='')
+               STD_FONT=str(REPO / 'frontend/fonts/Manrope.ttf'), DM_ENTITLEMENTS='',
+               DM_COPY_ROMFS='YES', DM_FULL_ROMFS='1')
     raw = root / 'unpublished.ipa'
     run(sys.executable, REPO / 'engine/scripts/build_ipa_from_nsp.py', root / 'dump',
         '--work-dir', root / 'work', '--platform', 'ios', '--romfs', 'bundle', '--gpu', 'none',

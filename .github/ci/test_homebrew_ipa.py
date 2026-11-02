@@ -48,6 +48,25 @@ class OriginalPayload(unittest.TestCase):
                          [('svc', '#0x27'), ('svc', '#0xb')])
         self.assertIn('0x4400', instructions[0].op_str)
 
+    def test_bundled_romfs_matches_sources_and_rejects_missing_or_changed_data(self):
+        import sys
+        sys.path.insert(0, str(homebrew.REPO / 'engine/dm/tools'))
+        import romfs_image
+        with tempfile.TemporaryDirectory() as temp:
+            root = homebrew.generate(Path(temp) / 'fixture')
+            original = root / 'dump/base/romfs'
+            for stage in ('vert', 'frag'):
+                (original / f'triangle.{stage}.spv').write_bytes(b'original shader test data')
+            packed = root / 'test.img'
+            romfs_image.pack(original, packed)
+            image = packed.read_bytes()
+            homebrew.validate_romfs(image, original)
+            with self.assertRaises(RuntimeError):
+                homebrew.validate_romfs(b'', original)
+            changed = image.replace(homebrew.MESSAGE, b'X' * len(homebrew.MESSAGE))
+            with self.assertRaises(RuntimeError):
+                homebrew.validate_romfs(changed, original)
+
 
 if __name__ == '__main__':
     unittest.main()
