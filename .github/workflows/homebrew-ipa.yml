@@ -1,0 +1,95 @@
+name: Build redistributable homebrew IPA
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths: ['homebrew/**', '.github/ci/homebrew_ipa.py', '.github/ci/test_homebrew_ipa.py', '.github/workflows/homebrew-ipa.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: homebrew-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  homebrew:
+    runs-on: xcode-27
+    timeout-minutes: 40
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check capacity and select Xcode 27.2 explicitly
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/homebrew-output/logs"
+          python3 .github/ci/apple_ci.py disk 8 "$RUNNER_TEMP" | tee "$RUNNER_TEMP/homebrew-output/logs/disk.log"
+          python3 .github/ci/homebrew_ipa.py select-xcode | tee "$RUNNER_TEMP/homebrew-output/logs/versions.log"
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'
+          architecture: arm64
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Install dependencies and sync the pinned engine
+        run: |
+          set -euo pipefail
+          {
+            brew install xcodegen zstd spirv-cross glslang
+            python -m venv .venv
+            .venv/bin/python -m pip install lz4 'capstone>=5,<6' fonttools zbic nsz "backports.zstd; python_version < '3.14'"
+            echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+            xcodebuild -downloadComponent MetalToolchain
+            git config core.hooksPath .githooks
+            python tools/engine.py sync
+            python tools/engine.py stale
+            dotnet --info
+          } 2>&1 | tee "$RUNNER_TEMP/homebrew-output/logs/dependencies.log"
+
+      - name: Validate original homebrew generator
+        run: |
+          set -euo pipefail
+          python -m unittest discover -s .github/ci -p 'test_*.py' -v 2>&1 | tee "$RUNNER_TEMP/homebrew-output/logs/unit-tests.log"
+
+      - name: Build original homebrew through the complete dump-to-IPA route
+        run: |
+          set -euo pipefail
+          python .github/ci/homebrew_ipa.py build --root "$RUNNER_TEMP/homebrew-build" --output "$RUNNER_TEMP/homebrew-output" 2>&1 | tee "$RUNNER_TEMP/homebrew-output/logs/build.log"
+          python .github/ci/apple_ci.py disk 4 "$RUNNER_TEMP"
+
+      # The builder accepts no dump paths, keys, URLs or signing inputs. Only its original payload is allowed here.
+      - name: Upload the validated, redistributable IPA
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: NX2Apple-Homebrew-IPA-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/homebrew-output/NX2Apple-Homebrew.ipa
+            ${{ runner.temp }}/homebrew-output/SHA256SUMS.txt
+            ${{ runner.temp }}/homebrew-output/build-report.json
+            ${{ runner.temp }}/homebrew-output/archive-files.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload homebrew-only build diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: NX2Apple-Homebrew-logs-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/homebrew-output/logs/*.log
+            ${{ runner.temp }}/homebrew-build/work/logs/*.log
+          if-no-files-found: warn
+          retention-days: 7
